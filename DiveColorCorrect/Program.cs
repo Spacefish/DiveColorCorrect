@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Threading.Tasks.Dataflow;
 
 namespace DiveColorCorrect
 {
@@ -11,13 +12,22 @@ namespace DiveColorCorrect
     {
         static void Main(string[] args)
         {
-            var img = new OpenCvSharp.Mat("divescene.png", OpenCvSharp.ImreadModes.Color);
             var wb = OpenCvSharp.XPhoto.SimpleWB.Create();
             wb.P = 0.2f;
             wb.OutputMin = 8.0f;
-            AutoResetEvent decodeQueueThrottleWaiter = new AutoResetEvent(false);
-            ManualResetEvent decodeQueueFrameWaiter = new ManualResetEvent(false);
 
+            var decodedFramesBlock = new TransformBlock<OpenCvSharp.Mat, OpenCvSharp.Mat>(
+                mat =>
+                {
+                    return Task.Run(() => { wb.BalanceWhite(mat, mat); return mat; });
+                },
+                new ExecutionDataflowBlockOptions
+                {
+                    BoundedCapacity = 10,
+                    MaxDegreeOfParallelism = 10,
+                    EnsureOrdered = true,
+                }
+            );
 
             // var inputVideo = new OpenCvSharp.VideoCapture("2017_0928_105336_023.MOV");
             var inputVideo = new OpenCvSharp.VideoCapture("YI004801.mp4");
@@ -28,63 +38,37 @@ namespace DiveColorCorrect
             // decoder
             Task decodeTask = Task.Factory.StartNew(() =>
             {
-                Task processTask = null;
                 while (true)
                 {
                     var mat = inputVideo.RetrieveMat();
                     if (mat.Height == 0)
                     {
-                        decodedFramesQueue.Enqueue(null);
-                        decodeQueueFrameWaiter.Set();
+                        Console.WriteLine("DECODED");
+                        decodedFramesBlock.Complete();
                         break;
                     }
-                    while(decodedFramesQueue.Count >= 10)
-                    {
-                        decodeQueueThrottleWaiter.WaitOne();
-                    }
-
-                    processTask?.Wait();
-
-                    processTask = Task.Factory.StartNew(() =>
-                    {
-                        wb.BalanceWhite(mat, mat);
-                        decodedFramesQueue.Enqueue(mat);
-                        decodeQueueFrameWaiter.Set();
-                    });
+                    decodedFramesBlock.SendAsync(mat).Wait();
                 }
             });
 
             Task writeTask = Task.Factory.StartNew(() =>
             {
                 int c = 0;
-                while(decodeQueueFrameWaiter.WaitOne()) {
-                    OpenCvSharp.Mat frame;
-                    bool success = decodedFramesQueue.TryDequeue(out frame);
-                    if(success)
-                    {
-                        decodeQueueThrottleWaiter.Set();
-                        // last frame exit!
-                        if (frame == null)
-                        {
-                            break;
-                        }
-
-                        ++c;
-                        outputVideo.Write(frame);
-                        frame.Dispose();
-                        Console.Write("Writer: Frame [" + c + "/" + inputVideo.FrameCount + "]\r");
-                    }
-                    else
-                    {
-                        decodeQueueFrameWaiter.Reset();
-                    }
+                OpenCvSharp.Mat mat;
+                while (!decodedFramesBlock.Completion.IsCompleted)
+                {
+                    ++c;
+                    mat = decodedFramesBlock.Receive();
+                    outputVideo.Write(mat);
+                    mat.Dispose();
+                    Console.WriteLine("Frame " + c + " of " + inputVideo.FrameCount);
                 }
             });
 
             decodeTask.Wait();
             writeTask.Wait();
 
-            Console.WriteLine("\nready!");
+            Console.WriteLine("ready!");
             outputVideo.Release();
             /*
             var channels = img.Split();
@@ -95,9 +79,6 @@ namespace DiveColorCorrect
             }
             OpenCvSharp.Cv2.Merge(channels, img);
             */
-            img.SaveImage("eq.png");
-            
-            Console.WriteLine("Hello World!");
         }
     }
 }
